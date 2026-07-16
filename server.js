@@ -179,14 +179,14 @@ async function handleAnalisarContrato(req, res) {
     return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
   }
 
-  const { prompt } = body;
+  const { prompt, maxTokens } = body;
   if (!prompt) {
     return send(res, 400, { error: 'prompt é obrigatório' });
   }
 
   const anthropicPayload = JSON.stringify({
     model: 'claude-sonnet-4-6',
-    max_tokens: 1500,
+    max_tokens: Math.min(Math.max(Number(maxTokens) || 1500, 256), 8000),
     messages: [{
       role: 'user',
       content: [{ type: 'text', text: prompt }],
