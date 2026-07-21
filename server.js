@@ -242,6 +242,73 @@ function getGoogleAccessToken() {
   });
 }
 
+// ---------- Análise de contrato via IA (texto extraído do PDF) ----------
+async function handleAnalisarContrato(req, res) {
+  if (!checkAuth(req)) {
+    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return send(res, 500, { error: 'ANTHROPIC_API_KEY não configurada no servidor' });
+  }
+
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (e) {
+    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
+  }
+
+  const { prompt } = body;
+  if (!prompt) {
+    return send(res, 400, { error: 'prompt é obrigatório' });
+  }
+  // Contratos costumam ter bastante campo (partes, volumes, prazos, preços, cláusulas) —
+  // damos uma margem generosa de resposta, mas com um teto de segurança.
+  let maxTokens = parseInt(body.maxTokens, 10);
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) maxTokens = 2500;
+  maxTokens = Math.min(maxTokens, 4096);
+
+  const anthropicPayload = JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    max_tokens: maxTokens,
+    messages: [{
+      role: 'user',
+      content: [{ type: 'text', text: prompt }],
+    }],
+  });
+
+  const options = {
+    hostname: 'api.anthropic.com',
+    path: '/v1/messages',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Length': Buffer.byteLength(anthropicPayload),
+    },
+  };
+
+  const anthropicReq = https.request(options, (anthropicRes) => {
+    let responseData = '';
+    anthropicRes.on('data', (chunk) => { responseData += chunk; });
+    anthropicRes.on('end', () => {
+      res.writeHead(anthropicRes.statusCode, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(responseData);
+    });
+  });
+
+  anthropicReq.on('error', (err) => {
+    send(res, 502, { error: 'Falha ao consultar a IA', detail: err.message });
+  });
+
+  anthropicReq.write(anthropicPayload);
+  anthropicReq.end();
+}
+
 async function handleSheetSync(req, res) {
   if (!checkAuth(req)) {
     return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
@@ -334,6 +401,46 @@ async function handlePushUnsubscribe(req, res) {
   return send(res, 200, { ok: true });
 }
 
+async function handlePushBroadcast(req, res) {
+  if (!checkAuth(req)) {
+    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
+  }
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    return send(res, 500, { error: 'VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configuradas no servidor' });
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (e) {
+    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
+  }
+  const { title, message, url } = body;
+  if (!title) {
+    return send(res, 400, { error: 'title é obrigatório' });
+  }
+  // Avisa TODO MUNDO que tiver notificações ativas em algum aparelho — não mira num usuário
+  // específico, porque quem gerencia a colheita nem sempre é o dono da carga.
+  const payload = JSON.stringify({ title, body: message || '', url: url || '/' });
+  const chavesPush = Object.keys(db).filter((k) => k.startsWith('push-subs:'));
+  let enviados = 0;
+  for (const chave of chavesPush) {
+    const subs = (db[chave] && db[chave].value) || [];
+    const restantes = [];
+    for (const sub of subs) {
+      try {
+        await webpush.sendNotification(sub, payload);
+        enviados++;
+        restantes.push(sub);
+      } catch (err) {
+        if (err.statusCode !== 404 && err.statusCode !== 410) restantes.push(sub);
+      }
+    }
+    db[chave] = { value: restantes, updatedAt: new Date().toISOString() };
+  }
+  saveDB(db);
+  return send(res, 200, { ok: true, enviados });
+}
+
 async function handlePushSend(req, res) {
   if (!checkAuth(req)) {
     return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
@@ -390,6 +497,10 @@ const server = http.createServer(async (req, res) => {
       return handleOcrRomaneio(req, res);
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/analisar-contrato') {
+      return handleAnalisarContrato(req, res);
+    }
+
     // Rota de sincronização com Google Sheets — mesma lógica, checada antes do filtro de /api/storage.
     if (req.method === 'GET' && url.pathname === '/api/sheet-sync') {
       return handleSheetSync(req, res);
@@ -407,6 +518,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/api/push/send') {
       return handlePushSend(req, res);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/push/broadcast') {
+      return handlePushBroadcast(req, res);
     }
 
     // Só atende as demais rotas dentro de /api/storage
@@ -467,7 +581,8 @@ server.listen(PORT, () => {
   console.log(`\n✅ Servidor BRC rodando em http://localhost:${PORT}`);
   console.log(`   Rotas disponíveis em: http://localhost:${PORT}/api/storage`);
   console.log(`   Rota de OCR em: http://localhost:${PORT}/api/ocr-romaneio`);
+  console.log(`   Rota de análise de contrato em: http://localhost:${PORT}/api/analisar-contrato`);
   console.log(`   Rota de sync com Google Sheets em: http://localhost:${PORT}/api/sheet-sync`);
-  console.log(`   Rotas de push em: /api/push/vapid-public-key, /api/push/subscribe, /api/push/unsubscribe, /api/push/send`);
+  console.log(`   Rotas de push em: /api/push/vapid-public-key, /api/push/subscribe, /api/push/unsubscribe, /api/push/send, /api/push/broadcast`);
   console.log(`   Dados salvos em: ${DATA_FILE}\n`);
 });
