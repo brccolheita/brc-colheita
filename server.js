@@ -288,7 +288,8 @@ async function handleSheetSync(req, res) {
 
 // ---------- Push notifications (Web Push / VAPID) ----------
 // Guardamos as inscrições dentro do próprio data.json, numa chave por produtor:
-//   push-subs:<produtorId>  ->  { value: [ {endpoint, keys:{p256dh,auth}}, ... ] }
+//   push-subs:<usuarioId>  ->  { value: [ {endpoint, keys:{p256dh,auth}}, ... ] }
+// usuarioId = o id da conta de login (admin, produtor ou motorista) — qualquer usuário pode ativar.
 async function handlePushSubscribe(req, res) {
   if (!checkAuth(req)) {
     return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
@@ -299,11 +300,11 @@ async function handlePushSubscribe(req, res) {
   } catch (e) {
     return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
   }
-  const { produtorId, subscription } = body;
-  if (!produtorId || !subscription || !subscription.endpoint) {
-    return send(res, 400, { error: 'produtorId e subscription são obrigatórios' });
+  const { usuarioId, subscription } = body;
+  if (!usuarioId || !subscription || !subscription.endpoint) {
+    return send(res, 400, { error: 'usuarioId e subscription são obrigatórios' });
   }
-  const chave = 'push-subs:' + produtorId;
+  const chave = 'push-subs:' + usuarioId;
   const atuais = (db[chave] && db[chave].value) || [];
   const semDuplicata = atuais.filter((s) => s.endpoint !== subscription.endpoint);
   semDuplicata.push(subscription);
@@ -322,11 +323,11 @@ async function handlePushUnsubscribe(req, res) {
   } catch (e) {
     return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
   }
-  const { produtorId, endpoint } = body;
-  if (!produtorId || !endpoint) {
-    return send(res, 400, { error: 'produtorId e endpoint são obrigatórios' });
+  const { usuarioId, endpoint } = body;
+  if (!usuarioId || !endpoint) {
+    return send(res, 400, { error: 'usuarioId e endpoint são obrigatórios' });
   }
-  const chave = 'push-subs:' + produtorId;
+  const chave = 'push-subs:' + usuarioId;
   const atuais = (db[chave] && db[chave].value) || [];
   db[chave] = { value: atuais.filter((s) => s.endpoint !== endpoint), updatedAt: new Date().toISOString() };
   saveDB(db);
@@ -346,14 +347,14 @@ async function handlePushSend(req, res) {
   } catch (e) {
     return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
   }
-  const { produtorId, title, message, url } = body;
-  if (!produtorId || !title) {
-    return send(res, 400, { error: 'produtorId e title são obrigatórios' });
+  const { usuarioId, title, message, url } = body;
+  if (!usuarioId || !title) {
+    return send(res, 400, { error: 'usuarioId e title são obrigatórios' });
   }
-  const chave = 'push-subs:' + produtorId;
+  const chave = 'push-subs:' + usuarioId;
   const subs = (db[chave] && db[chave].value) || [];
   if (!subs.length) {
-    return send(res, 200, { ok: true, enviados: 0, aviso: 'este produtor ainda não ativou notificações em nenhum aparelho' });
+    return send(res, 200, { ok: true, enviados: 0, aviso: 'este usuário ainda não ativou notificações em nenhum aparelho' });
   }
   const payload = JSON.stringify({ title, body: message || '', url: url || '/' });
   const restantes = [];
