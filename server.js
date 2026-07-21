@@ -56,6 +56,9 @@ if (!process.env.ANTHROPIC_API_KEY) {
 if (!process.env.GOOGLE_SHEET_ID || !process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || !process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY) {
   console.warn('\n⚠️  ATENÇÃO: sincronização com Google Sheets não configurada (faltam GOOGLE_SHEET_ID / GOOGLE_SERVICE_ACCOUNT_EMAIL / GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY).\n');
 }
+if (!process.env.ERP_WEBHOOK_SECRET) {
+  console.warn('\n⚠️  ATENÇÃO: ERP_WEBHOOK_SECRET não configurado. A rota /api/erp/webhook-nf vai recusar qualquer chamada até essa variável ser definida — configure-a quando for plugar o ERP de faturamento.\n');
+}
 
 // ---------- "Banco de dados" simples em arquivo JSON ----------
 function loadDB() {
@@ -110,6 +113,16 @@ function checkAuth(req) {
   if (!key || key.length !== API_KEY.length) return false;
   // comparação em tempo constante, para evitar timing attacks
   return crypto.timingSafeEqual(Buffer.from(key), Buffer.from(API_KEY));
+}
+
+// Autenticação separada da do painel (x-api-key): o ERP de faturamento chama essa rota
+// de fora, então usa um segredo próprio (x-erp-secret), pra não misturar com a chave do app.
+function checkErpWebhookAuth(req) {
+  const secret = process.env.ERP_WEBHOOK_SECRET;
+  if (!secret) return false; // sem segredo configurado, a rota fica sempre fechada
+  const recebido = req.headers['x-erp-secret'];
+  if (!recebido || recebido.length !== secret.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(recebido), Buffer.from(secret));
 }
 
 // ---------- OCR de romaneio via IA (Anthropic) ----------
@@ -481,6 +494,63 @@ async function handlePushSend(req, res) {
   return send(res, 200, { ok: true, enviados });
 }
 
+// ---------- Integração com ERP de faturamento (webhook) ----------
+// CONTRATO ESPERADO (documentar pro time do ERP quando a API deles estiver disponível):
+//
+//   POST /api/erp/webhook-nf
+//   Header:  x-erp-secret: <ERP_WEBHOOK_SECRET>
+//   Body (JSON):
+//     {
+//       "tipo": "armazem" | "nf",
+//       "dados": [ { ...um objeto por romaneio/NF, chaves livres — o painel identifica
+//                    o formato pelos nomes das colunas, igual já faz com a importação
+//                    de planilha/PDF... } ]
+//     }
+//
+//   "tipo":"armazem"  -> entrada no armazém próprio (sem comprador), campos esperados:
+//       armazem, produtor, cultura, safra, motorista, placa, romaneio, data,
+//       pesoBruto, tara, umidade, impureza, ardido, observacao
+//   "tipo":"nf"       -> nota fiscal de venda/remessa emitida, campos esperados:
+//       status, produtor, numero, valorTotal, dataEmissao, operacao, destinatario,
+//       transportadora, placa, observacao
+//
+// O painel (index.html) busca essa fila periodicamente via GET /api/erp/fila
+// (autenticado com a x-api-key normal do app) e importa cada item usando a MESMA
+// lógica que já existe pra importação de planilha/PDF — não duplica regra nenhuma.
+async function handleErpWebhookNF(req, res) {
+  if (!checkErpWebhookAuth(req)) {
+    return send(res, 401, { error: 'segredo do webhook inválido ou ausente (header x-erp-secret) — configure ERP_WEBHOOK_SECRET no servidor' });
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (e) {
+    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
+  }
+  const { tipo, dados } = body;
+  if (!tipo || !Array.isArray(dados) || !dados.length) {
+    return send(res, 400, { error: '"tipo" (armazem|nf) e "dados" (array não vazio) são obrigatórios' });
+  }
+  const chave = 'erp-webhook-fila';
+  const fila = (db[chave] && db[chave].value) || [];
+  fila.push({ tipo, dados, recebidoEm: new Date().toISOString() });
+  db[chave] = { value: fila, updatedAt: new Date().toISOString() };
+  saveDB(db);
+  return send(res, 200, { ok: true, recebidos: dados.length, posicaoNaFila: fila.length });
+}
+
+async function handleErpFila(req, res) {
+  if (!checkAuth(req)) {
+    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
+  }
+  const chave = 'erp-webhook-fila';
+  const fila = (db[chave] && db[chave].value) || [];
+  // devolve e já limpa a fila (o painel processa tudo na hora) — evita reprocessar o mesmo lote depois
+  db[chave] = { value: [], updatedAt: new Date().toISOString() };
+  saveDB(db);
+  return send(res, 200, { itens: fila });
+}
+
 // ---------- Servidor ----------
 const server = http.createServer(async (req, res) => {
   try {
@@ -504,6 +574,14 @@ const server = http.createServer(async (req, res) => {
     // Rota de sincronização com Google Sheets — mesma lógica, checada antes do filtro de /api/storage.
     if (req.method === 'GET' && url.pathname === '/api/sheet-sync') {
       return handleSheetSync(req, res);
+    }
+
+    // Integração com o ERP de faturamento: o ERP empurra (webhook) e o painel busca (fila).
+    if (req.method === 'POST' && url.pathname === '/api/erp/webhook-nf') {
+      return handleErpWebhookNF(req, res);
+    }
+    if (req.method === 'GET' && url.pathname === '/api/erp/fila') {
+      return handleErpFila(req, res);
     }
 
     // Rotas de notificação push
@@ -583,6 +661,7 @@ server.listen(PORT, () => {
   console.log(`   Rota de OCR em: http://localhost:${PORT}/api/ocr-romaneio`);
   console.log(`   Rota de análise de contrato em: http://localhost:${PORT}/api/analisar-contrato`);
   console.log(`   Rota de sync com Google Sheets em: http://localhost:${PORT}/api/sheet-sync`);
+  console.log(`   Rotas de integração ERP em: POST /api/erp/webhook-nf (o ERP chama) e GET /api/erp/fila (o painel busca)`);
   console.log(`   Rotas de push em: /api/push/vapid-public-key, /api/push/subscribe, /api/push/unsubscribe, /api/push/send, /api/push/broadcast`);
   console.log(`   Dados salvos em: ${DATA_FILE}\n`);
 });
