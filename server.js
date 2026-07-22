@@ -562,6 +562,20 @@ function calcSaldoFazendaKgServer(fazendaId, movimentosEstoque) {
     .filter((m) => m.fazendaId === fazendaId)
     .reduce((acc, m) => acc + (m.tipo === 'saida' ? -Number(m.pesoKg || 0) : Number(m.pesoKg || 0)), 0);
 }
+// Mesmo modelo físico (balanço de massa) + calibração usado no painel — ver calcularCapacidadeEfetivaSecador
+// no index.html. Mantido em espelho aqui porque o push programado roda direto no servidor, sem o navegador aberto.
+function capacidadeEfetivaSecadorServer(capacidadeNominalTonHora, ueRefPct, usAlvoPct, uePct, fatorCalibracao) {
+  const capNominal = Number(capacidadeNominalTonHora) || 0;
+  const fator = Number(fatorCalibracao) || 1;
+  if (!capNominal) return null;
+  const ueRef = Number(ueRefPct) / 100, usRef = Number(usAlvoPct) / 100;
+  const ueReal = Number(uePct) / 100, usAlvo = Number(usAlvoPct) / 100;
+  if (!(ueRef > usRef) || !(ueReal > usAlvo)) return null;
+  const fracaoNominal = 1 - (1 - ueRef) / (1 - usRef);
+  const fracaoReal = 1 - (1 - ueReal) / (1 - usAlvo);
+  if (fracaoReal <= 0) return null;
+  return capNominal * (fracaoNominal / fracaoReal) * fator;
+}
 function comprometimentoSecadorServer(f, romaneiosArmazem, config) {
   const secadorTonHora = Number(f.secadorTonHora) || 0;
   if (!secadorTonHora) return null;
@@ -577,10 +591,15 @@ function comprometimentoSecadorServer(f, romaneiosArmazem, config) {
     return (Number(r.umidade || 0) / pesoBruto * 100) > umidadeSegura;
   });
   const kgNoSecador = cargasSecador.reduce((s, r) => s + Number(r.pesoLiquido || 0), 0);
-  const capacidadeSecadorKg = secadorTonHora * 1000 * horas;
   const umidadeMediaSecador = cargasSecador.length
     ? cargasSecador.reduce((s, r) => s + (Number(r.umidade || 0) / Number(r.pesoBruto || 1) * 100), 0) / cargasSecador.length
     : null;
+  let capTonHoraUsado = secadorTonHora;
+  if (f.secadorUmidadeRefPct && umidadeMediaSecador !== null) {
+    const efetiva = capacidadeEfetivaSecadorServer(secadorTonHora, f.secadorUmidadeRefPct, umidadeSegura, umidadeMediaSecador, f.secadorFatorCalibracao);
+    if (efetiva !== null) capTonHoraUsado = efetiva;
+  }
+  const capacidadeSecadorKg = capTonHoraUsado * 1000 * horas;
   return {
     capacidadeSecadorKg, kgNoSecador, umidadeMediaSecador,
     pct: capacidadeSecadorKg > 0 ? (kgNoSecador / capacidadeSecadorKg * 100) : 0,
